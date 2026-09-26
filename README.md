@@ -1,194 +1,249 @@
 # SemanticID Generative Recommender
 
-A generative recommendation system that represents items with **RQ-VAE Semantic IDs** and autoregressively generates the next item's ID with a Transformer. This repository also includes **Hierarchical Semantic-ID Weighted Loss (HSWL)** experiments and an Apple Silicon / PyTorch MPS execution path.
+A generative recommendation system based on **Semantic IDs**, using **RQ-VAE** for item tokenization and a **Transformer** for autoregressive next-item generation.
 
-The project is developed from Edoardo Botta's MIT-licensed PyTorch RQ-VAE / generative-retrieval implementation. The original copyright notice is preserved in `LICENSE`; the extensions in this repository focus on MPS compatibility, training reliability, reproducible evaluation, and hierarchical Semantic-ID modeling.
+This repository extends an existing PyTorch implementation of *Recommender Systems with Generative Retrieval* with hierarchical Semantic-ID loss weighting, reproducible experiments, evaluation utilities, and compatibility improvements.
 
-## Method
+## Overview
+
+Generative retrieval formulates recommendation as a sequence generation problem. Instead of directly scoring every candidate item, each item is represented by a short sequence of discrete Semantic IDs, and the recommendation model generates the Semantic ID of the next item.
+
+The system contains two stages:
+
+1. **Semantic-ID tokenization** — an RQ-VAE converts item representations into hierarchical discrete codes.
+2. **Generative retrieval** — a Transformer models users' historical Semantic-ID sequences and autoregressively generates the Semantic ID of the next item.
 
 ```text
-Item content embedding
-        ↓
+Item representations
+        |
+        v
       RQ-VAE
-        ↓
-(RQ1, RQ2, RQ3, DEDUP)
-        ↓
-User Semantic-ID sequence
-        ↓
+        |
+        v
+Hierarchical Semantic IDs
+        |
+        v
+User interaction sequence
+        |
+        v
     Transformer
-        ↓
-Next-item Semantic-ID generation
+        |
+        v
+Next-item Semantic ID
+        |
+        v
+Recommended item
 ```
 
-The pipeline first maps each item to a hierarchical Semantic ID. A Transformer then models user interaction histories as Semantic-ID sequences and generates the next item's ID autoregressively. Prefix verification restricts generated IDs to items that exist in the corpus.
-
-## Project extensions
-
-- **Hierarchical Semantic-ID Weighted Loss (HSWL):** configurable loss weights for RQ1, RQ2, RQ3 and DEDUP, with controlled comparison against equal weighting.
-- **Apple Silicon / MPS support:** pure-PyTorch fallback when Triton is unavailable and a padded `nn.Transformer` path for unsupported jagged/nested MPS attention.
-- **Training reliability:** reproducible Python/PyTorch seeding, corrected resume iteration range, final-checkpoint saving after resume, and padded-path unreduced-loss handling.
-- **Evaluation utilities:** full Semantic-ID HitRate@1/5/10 subset evaluation, position-wise token loss/accuracy analysis, and an MPS generation smoke test.
-
-## HSWL
-
-The equal-weight decoder objective uses:
+For the Amazon Beauty setup used in the experiments, an item is represented by four components:
 
 ```text
-Baseline = [1.00, 1.00, 1.00, 1.00]
-             RQ1   RQ2   RQ3  DEDUP
+[RQ1, RQ2, RQ3, DEDUP]
 ```
 
-The tested HSWL-A configuration reallocates the same total weight toward earlier hierarchy levels:
+`RQ1`–`RQ3` are produced by the residual quantization layers. `DEDUP` is an additional identifier used to distinguish items that would otherwise share the same quantized representation.
+
+## Hierarchical Semantic-ID Weighted Loss
+
+The baseline decoder applies equal weight to every Semantic-ID position:
 
 ```text
-HSWL-A   = [1.50, 1.25, 0.75, 0.50]
+[1.0, 1.0, 1.0, 1.0]
 ```
 
-For per-example position losses `L_d`:
+Because different levels of a hierarchical Semantic ID can have different prediction difficulty, this project implements **Hierarchical Semantic-ID Weighted Loss (HSWL)**.
+
+The HSWL-A configuration used in the controlled experiment is:
 
 ```text
-L = mean_batch(sum_d w_d * L_d)
+[1.5, 1.25, 0.75, 0.5]
 ```
 
-Both configurations sum to 4, reducing loss-scale / learning-rate confounding in the controlled comparison.
+The four weights sum to the same value as the baseline weights, limiting changes in the overall loss scale while shifting more optimization emphasis toward earlier semantic levels.
 
-## Experimental setup
+The training objective is:
 
-| Setting | Value |
-|---|---|
-| Dataset | Amazon Reviews - Beauty |
-| Hardware | Apple M4, 24 GB unified memory |
-| Backend | PyTorch MPS |
-| RQ-VAE | Upstream pretrained Amazon Beauty high-entropy checkpoint |
-| Semantic-ID dimensions | RQ1, RQ2, RQ3, DEDUP |
-| Codebook size | 256 |
-| Decoder batch size | 256 |
-| Learning rate | 3e-4 |
-| Weight decay | 0.035 |
-| Decoder | 8 attention layers, 8 heads, 512 attention dim |
-| Dropout | 0.3 |
-| Controlled 5k seed | 2026 |
+```text
+L = mean(
+      w1 * CE(RQ1)
+    + w2 * CE(RQ2)
+    + w3 * CE(RQ3)
+    + w4 * CE(DEDUP)
+)
+```
 
-The pretrained RQ-VAE is used for the reported decoder experiments. The local RQ-VAE smoke run is only an engineering check and is not used as the tokenizer for the reported results.
+Unweighted position-wise losses are retained separately for analysis.
 
-## Results
+## Experiments
 
-### Decoder training-budget study
+Experiments were conducted on the **Amazon Reviews Beauty** dataset. Decoder experiments use the released pretrained Amazon Beauty RQ-VAE checkpoint to generate Semantic IDs.
 
-Full evaluation set (`22,363` examples), exact match over all four Semantic-ID positions:
+The primary recommendation metrics are full Semantic-ID **HitRate@K (H@K)**. Position-wise cross-entropy and accuracy are additionally used to analyze the behavior of individual Semantic-ID levels.
+
+### Decoder Training Budget
+
+The baseline decoder was evaluated at 10k, 20k, and 30k training iterations.
 
 | Decoder checkpoint | H@1 | H@5 | H@10 |
-|---:|---:|---:|---:|
-| 10k steps | 0.002325 | 0.008943 | **0.016858** |
-| 20k steps | 0.002102 | 0.007065 | 0.016500 |
-| 30k steps | 0.002325 | 0.007557 | 0.016500 |
+| --- | ---: | ---: | ---: |
+| 10k | 0.002325 | 0.008943 | 0.016858 |
+| 20k | 0.002102 | 0.007065 | 0.016500 |
+| 30k | 0.002325 | 0.007557 | 0.016500 |
 
-Training loss continued to decrease across these checkpoints, while evaluated full-ID HitRate did not improve monotonically. These results are a training-budget study rather than validation-selected best checkpoints.
+Although training loss continued to decrease with additional optimization, the evaluated full-ID HitRate did not improve correspondingly. This illustrates that lower teacher-forced training loss does not necessarily translate into better end-to-end autoregressive retrieval.
 
-### HSWL controlled 5k experiment
+### HSWL Controlled Experiment
 
-The baseline and HSWL-A runs use the same training budget, seed, model, tokenizer and optimizer settings; only Semantic-ID loss weights differ. Position accuracy uses a fixed 4,096-example training subset, while end-to-end H@K uses the same fixed 1,024-example evaluation subset for both models.
+A controlled 5k-iteration comparison was performed using the same random seed and training setup.
 
-| Model | RQ1 Acc | RQ2 Acc | RQ3 Acc | DEDUP Acc | H@5 | H@10 |
-|---|---:|---:|---:|---:|---:|---:|
-| Equal-weight baseline | 3.760% | 10.327% | 13.159% | 92.725% | 0.001953 | 0.002930 |
-| HSWL-A | 3.760% | **13.257%** | **14.282%** | 92.749% | 0.001953 | 0.002930 |
+| Model | RQ1 Acc. | RQ2 Acc. | RQ3 Acc. | H@5 (1024) | H@10 (1024) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 3.760% | 10.327% | 13.159% | 0.001953 | 0.002930 |
+| HSWL-A | 3.760% | 13.257% | 14.282% | 0.001953 | 0.002930 |
 
-HSWL-A improves RQ2/RQ3 teacher-forced token accuracy at 5k steps, but this improvement does **not** translate into an observed end-to-end HitRate gain on the 1,024-example evaluation subset. The repository reports this as a negative end-to-end result rather than claiming a recommendation-quality improvement.
+HSWL-A improved teacher-forced prediction accuracy at the intermediate RQ2 and RQ3 levels under this training budget. However, the improvement did **not** translate into higher end-to-end HitRate on the evaluated 1024-sample subset.
+
+This result is retained as a negative result rather than being presented as an end-to-end recommendation improvement.
+
+## Key Findings
+
+The experiments highlight several practical observations:
+
+- Semantic-ID levels exhibit different prediction difficulty.
+- Reweighting the hierarchical loss changes how optimization is distributed across Semantic-ID positions.
+- HSWL-A improved RQ2 and RQ3 token-level accuracy in the controlled 5k experiment.
+- Better token-level teacher-forced metrics did not automatically produce better autoregressive recommendation HitRate.
+- Extending baseline decoder training from 10k to 30k iterations reduced training loss but did not improve the evaluated full-ID HitRate.
+
+These results emphasize the gap between token-level optimization and end-to-end generative retrieval quality.
+
+## Project Structure
+
+```text
+.
+├── configs/                         # Gin experiment configurations
+├── data/                            # Dataset processing code
+├── distributions/                   # Distribution utilities
+├── modules/                         # RQ-VAE and Transformer modules
+├── ops/                             # Low-level operators and fallbacks
+├── train_rqvae.py                   # RQ-VAE training
+├── train_decoder.py                 # Generative retrieval training
+├── eval_decoder_subset_mps.py       # Subset HitRate evaluation
+├── analyze_token_loss_mps.py        # Position-wise evaluation analysis
+├── analyze_train_token_loss_mps.py  # Train-subset token analysis
+├── test_generation_mps.py           # Generation smoke test
+├── requirements.txt
+└── LICENSE
+```
 
 ## Installation
+
+Create a Python environment and install the dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-For the Amazon Beauty decoder experiments, download the upstream pretrained RQ-VAE and place it at:
+The project uses `gin-config` for experiment configuration.
 
-```text
-trained_models/rqvae_amazon_beauty/checkpoint_high_entropy.pt
-```
+## Training
 
-Pretrained checkpoint: https://huggingface.co/edobotta/rqvae-amazon-beauty
+### RQ-VAE
 
-On Apple Silicon, commands that encounter unsupported MPS operators can use:
+Train the RQ-VAE tokenizer with:
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=1 <command>
+python train_rqvae.py configs/rqvae_amazon.gin
 ```
 
-## Reproducing the main experiments
-
-### Equal-weight baseline (5k)
+A lightweight smoke-test configuration is also provided:
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=1 MPS_LAUNCH_BLOCKING=1 \
-python train_decoder.py configs/decoder_amazon_baseline_5k_seed2026.gin
+python train_rqvae.py configs/rqvae_amazon_smoke.gin
 ```
 
-### HSWL-A (5k)
+### Decoder Baseline
+
+A baseline decoder can be trained with:
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=1 MPS_LAUNCH_BLOCKING=1 \
+python train_decoder.py configs/decoder_amazon_baseline.gin
+```
+
+The repository also contains configurations used for different decoder training budgets.
+
+### HSWL
+
+The controlled HSWL-A configuration can be run with:
+
+```bash
 python train_decoder.py configs/decoder_amazon_hswl_a_5k_seed2026.gin
 ```
 
-### End-to-end Semantic-ID evaluation
+The corresponding baseline comparison is:
+
+```bash
+python train_decoder.py configs/decoder_amazon_baseline_5k_seed2026.gin
+```
+
+Both configurations use the same seed and training budget so that the loss-weighting strategy is the primary experimental variable.
+
+## Evaluation
+
+Subset generation evaluation can be run with:
 
 ```bash
 PYTORCH_ENABLE_MPS_FALLBACK=1 python eval_decoder_subset_mps.py \
-  --checkpoint out/decoder/amazon_baseline_5k_seed2026/checkpoint_4999.pt \
+  --checkpoint <decoder-checkpoint> \
   --num-samples 1024 \
   --batch-size 2
 ```
 
-### Position-wise training analysis
+Position-wise Semantic-ID metrics can be analyzed with the provided analysis scripts.
+
+Checkpoint paths are intentionally not bundled with the repository. Download or train the required models locally and configure their paths before running the corresponding experiment.
+
+## Implementation Notes
+
+The project includes several engineering changes used during the experiments:
+
+- configurable Semantic-ID loss weights;
+- explicit Python and PyTorch random seeds;
+- corrected resumed-training iteration handling;
+- corrected final-checkpoint saving;
+- a pure PyTorch fallback for Triton-dependent jagged operations;
+- a padded Transformer execution path for environments where jagged/nested attention is not fully supported.
+
+The project was tested with PyTorch's **MPS** backend. Unsupported operations can use CPU fallback by setting:
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=1 python analyze_train_token_loss_mps.py \
-  --checkpoint out/decoder/amazon_baseline_5k_seed2026/checkpoint_4999.pt \
-  --num-samples 4096 \
-  --batch-size 256
-```
-
-Use `analyze_token_loss_mps.py` for evaluation-set position analysis.
-
-## Implementation notes
-
-- `model_jagged_mode=False` is used for the reported MPS decoder experiments because the original jagged/nested attention path is not fully supported on MPS.
-- `ops/triton/jagged.py` retains the Triton path when available and provides a pure-PyTorch fallback otherwise.
-- Generation retains stochastic candidate selection with `torch.multinomial`.
-- HSWL defaults to equal weights, preserving compatibility with existing decoder checkpoints.
-- Large datasets, experiment outputs and model checkpoints are intentionally excluded from version control.
-
-## Repository layout
-
-```text
-configs/                     experiment configurations
-modules/                     RQ-VAE, Transformer and retrieval model
-ops/triton/jagged.py         Triton path + PyTorch fallback
-data/                        dataset processing
-train_rqvae.py               RQ-VAE training
-train_decoder.py             generative retrieval training
-eval_decoder_subset_mps.py   full-ID HitRate evaluation
-analyze_token_loss_mps.py    evaluation position analysis
-analyze_train_token_loss_mps.py
-                             training-subset position analysis
-test_generation_mps.py       generation smoke test
+PYTORCH_ENABLE_MPS_FALLBACK=1
 ```
 
 ## Limitations
 
-- Experiments use a resource-constrained Apple Silicon setup rather than the original paper's accelerator setup or full training budget.
-- Decoder experiments use the upstream pretrained RQ-VAE rather than a locally trained full RQ-VAE.
-- The 5k HSWL comparison uses one controlled seed and is not a multi-seed statistical result.
-- The 1,024-example H@K comparison is a screening subset. Full 22,363-example results above are reported for the 10k/20k/30k baseline checkpoints.
-- HSWL improves intermediate token prediction in the reported experiment but does not establish an end-to-end recommendation improvement.
+- The experiments use the released pretrained Amazon Beauty RQ-VAE rather than reproducing the full tokenizer training budget from scratch.
+- Decoder training budgets are substantially smaller than large-scale paper training settings.
+- The reported HSWL experiment demonstrates token-level changes but does not establish an improvement in end-to-end recommendation HitRate.
+- The 1024-sample HSWL evaluation is a subset evaluation and should not be interpreted as a full benchmark result.
+- Results should therefore be interpreted as reproduction and controlled experimental observations rather than state-of-the-art claims.
 
-## Upstream and references
+## Upstream and Attribution
 
-This repository is derived from Edoardo Botta's MIT-licensed RQ-VAE generative-retrieval implementation. The original copyright notice is preserved in `LICENSE`.
+This repository is derived from the open-source PyTorch RQ-VAE / generative retrieval implementation by **Edoardo Botta** and retains the original **MIT License** and copyright notice.
 
-- Upstream implementation: https://github.com/EdoardoBotta/RQ-VAE
-- Rajput et al., *Recommender Systems with Generative Retrieval*: https://arxiv.org/abs/2305.05065
-- Jang et al., *Categorical Reparameterization with Gumbel-Softmax*: https://openreview.net/forum?id=rkE3y85ee
-- Fifty et al., *Restructuring Vector Quantization with the Rotation Trick*: https://arxiv.org/abs/2410.06424
+The project builds on the generative retrieval approach introduced in:
+
+**Recommender Systems with Generative Retrieval**  
+Shashank Rajput, Nikhil Mehta, Anima Singh, Raghunandan H. Keshavan, Trung Vu, Lukasz Heldt, Lichan Hong, Yi Tay, Vinh Q. Tran, Jonah Samost, Maciej Kula, Ed H. Chi, Maheswaran Sathiamoorthy.
+
+## References
+
+- Rajput et al., *Recommender Systems with Generative Retrieval*, 2023.
+- Jang, Gu, and Poole, *Categorical Reparameterization with Gumbel-Softmax*, 2017.
+- Fifty et al., *Restructuring Vector Quantization with the Rotation Trick*, 2024.
+- Original RQ-VAE / generative retrieval PyTorch implementation by Edoardo Botta.
+
+## License
+
+This project retains the upstream MIT License. See `LICENSE` for details.
