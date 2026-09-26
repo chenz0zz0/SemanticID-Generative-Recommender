@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+dataset/
+out/
+wandb/
+tl_out/
+*.csv
+trained_models/
